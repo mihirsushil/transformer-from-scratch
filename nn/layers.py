@@ -27,6 +27,42 @@ class Linear(Module):
         return [self.weight, self.bias]
 
 
+class Embedding(Module):
+    """Lookup table mapping integer token/position IDs to learned vectors.
+
+    Backward uses `np.add.at` rather than `weight.grad[idx] += out.grad` because
+    NumPy fancy-index `+=` drops duplicate indices within the same batch/sequence,
+    whereas `np.add.at` accumulates gradients for every occurrence of a repeated token.
+    """
+
+    def __init__(self, num_embeddings, embedding_dim):
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = Tensor(
+            np.random.randn(num_embeddings, embedding_dim) * 0.02,
+            requires_grad=True,
+        )
+
+    def __call__(self, idx):
+        idx_arr = np.asarray(idx, dtype=np.int64)
+        out = Tensor(
+            self.weight.data[idx_arr],
+            requires_grad=self.weight.requires_grad,
+            _children=(self.weight,),
+            _op="embedding",
+        )
+
+        def _backward():
+            if self.weight.requires_grad:
+                np.add.at(self.weight.grad, idx_arr, out.grad)
+
+        out._backward = _backward
+        return out
+
+    def parameters(self):
+        return [self.weight]
+
+
 class ReLU(Module):
     def __call__(self, x):
         return x.relu()
@@ -94,3 +130,12 @@ def cross_entropy_loss(logits, targets):
 
     nll = -(log_probs * Tensor(one_hot)).sum(axis=1)
     return nll.mean()
+
+
+def sequence_cross_entropy_loss(logits, targets):
+    """Cross-entropy loss over 3D sequence logits `(batch, seq, vocab_size)` and
+    integer targets `(batch, seq)`."""
+    batch, seq, vocab_size = logits.shape
+    flat_logits = logits.reshape(batch * seq, vocab_size)
+    flat_targets = np.asarray(targets, dtype=np.int64).reshape(batch * seq)
+    return cross_entropy_loss(flat_logits, flat_targets)

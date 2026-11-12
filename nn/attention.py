@@ -9,7 +9,7 @@ free.
 import numpy as np
 
 from .engine import Tensor
-from .layers import LayerNorm, Linear, Module, ReLU, Sequential
+from .layers import Embedding, LayerNorm, Linear, Module, ReLU, Sequential
 
 
 def scaled_dot_product_attention(q, k, v, causal_mask=False):
@@ -118,3 +118,60 @@ class TransformerBlock(Module):
             + self.norm2.parameters()
             + self.mlp.parameters()
         )
+
+
+class DecoderTransformer(Module):
+    """Full causal GPT-style decoder: token + positional embeddings, a stack of
+    pre-norm causal TransformerBlocks, final LayerNorm, and a vocabulary head."""
+
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, max_seq_len, mlp_ratio=4):
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+
+        self.token_embedding = Embedding(vocab_size, d_model)
+        self.pos_embedding = Embedding(max_seq_len, d_model)
+        self.blocks = [
+            TransformerBlock(d_model, num_heads, mlp_ratio=mlp_ratio, causal=True)
+            for _ in range(num_layers)
+        ]
+        self.ln_f = LayerNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+
+    def __call__(self, token_ids):
+        token_ids = np.asarray(token_ids, dtype=np.int64)
+        assert token_ids.ndim == 2, "token_ids must have shape (batch, seq)"
+        _batch, seq = token_ids.shape
+        assert seq <= self.max_seq_len, f"sequence length {seq} exceeds max_seq_len {self.max_seq_len}"
+
+        positions = np.arange(seq, dtype=np.int64)[None, :]
+        x = self.token_embedding(token_ids) + self.pos_embedding(positions)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+    def generate(self, prompt_ids, max_new_tokens, temperature=0.0, rng=None):
+        """Autoregressively generate `max_new_tokens` tokens given `prompt_ids` (1D list/array)."""
+        ids = list(np.asarray(prompt_ids, dtype=np.int64).ravel())
+        rng = rng or np.random.default_rng(0)
+        for _ in range(max_new_tokens):
+            context = np.asarray(ids[-self.max_seq_len :], dtype=np.int64)[None, :]
+            logits = self(context).data[0, -1]
+            if temperature <= 0.0:
+                next_id = int(np.argmax(logits))
+            else:
+                scaled = logits / temperature
+                shifted = np.exp(scaled - scaled.max())
+                probs = shifted / shifted.sum()
+                next_id = int(rng.choice(self.vocab_size, p=probs))
+            ids.append(next_id)
+        return ids
+
+    def parameters(self):
+        params = self.token_embedding.parameters() + self.pos_embedding.parameters()
+        for block in self.blocks:
+            params.extend(block.parameters())
+        params.extend(self.ln_f.parameters())
+        params.extend(self.lm_head.parameters())
+        return params
